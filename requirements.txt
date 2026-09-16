@@ -1,0 +1,4 @@
+aiohttp==3.14.3
+beautifulsoup4==4.15.0
+Pillow==12.3.0
+python-dotenv==1.2.3
