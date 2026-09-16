@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import sqlite3
+import ssl
 import threading
 import time
 from collections import OrderedDict
@@ -117,6 +118,16 @@ MAX_SSL_VERIFY = (
     os.getenv("MAX_SSL_VERIFY", "true").strip().lower()
     not in ("0", "false", "no", "off")
 )
+# Дополнительные корневые сертификаты. Если MAX отвечает сертификатом,
+# подписанным УЦ Минцифры (Russian Trusted CA), стандартное хранилище
+# (набор Mozilla в python:3.11-slim) его не знает и соединение падает
+# с CERTIFICATE_VERIFY_FAILED. Проверка сертификата при этом остаётся
+# включённой: бандл добавляется поверх системного хранилища.
+# Значение: путь к PEM/DER-файлу, каталог с .crt/.pem или сам PEM-текст.
+# Пусто (по умолчанию) — берётся certs/max_ca_bundle.crt рядом с bot.py,
+# если файл есть. «none»/«off» — ничего не добавлять.
+MAX_SSL_CA_BUNDLE = os.getenv("MAX_SSL_CA_BUNDLE", "").strip()
+CA_BUNDLE_DISABLED = ("none", "off", "no", "false", "0")
 
 # Rate limiter. Значения достаточно мягкие для обычного просмотра расписания,
 # но защищают сайт и генератор от автоматического шквала запросов.
@@ -141,6 +152,10 @@ TZ = ZoneInfo(TIMEZONE)
 # Каталоги / файлы
 BASE_DIR = Path(__file__).resolve().parent
 FONTS_DIR = BASE_DIR / "fonts"
+CERTS_DIR = BASE_DIR / "certs"
+# Бандл УЦ Минцифры из репозитория: подхватывается автоматически, если
+# MAX_SSL_CA_BUNDLE не задан явно (см. resolve_ca_bundle()).
+BUNDLED_CA_BUNDLE = CERTS_DIR / "max_ca_bundle.crt"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 IMAGE_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "bot.db"
@@ -678,6 +693,145 @@ HEADERS = {
 }
 
 
+# ============================================================
+# TLS: доверие сертификату MAX API
+# ============================================================
+
+SSL_ERROR_HINT = (
+    " Сертификат MAX не проверен. Добавь недостающий корневой сертификат:"
+    " MAX_SSL_CA_BUNDLE=/путь/к/ca.pem (в репозитории уже лежит"
+    " certs/max_ca_bundle.crt — УЦ Минцифры, он подхватывается сам)."
+    " Если сертификат от публичного УЦ — обнови ca-certificates в образе;"
+    " если трафик подменяет прокси — добавь его CA тем же параметром."
+    " Крайний вариант для закрытого контура — MAX_SSL_VERIFY=false"
+    " (проверка отключается полностью)."
+)
+_CA_EXTENSIONS = (".crt", ".pem", ".cer")
+_PEM_CERT_RE = re.compile(
+    r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.DOTALL
+)
+
+_SSL_CONTEXT: Optional[ssl.SSLContext] = None
+_CA_BUNDLE_SOURCE = ""
+
+
+def extract_pem_certificates(data) -> str:
+    """Только PEM-блоки сертификатов из файла/строки.
+
+    ``ssl.SSLContext.load_verify_locations(cadata=...)`` принимает строку
+    лишь в ASCII, поэтому поясняющие комментарии (в бандле они на русском)
+    вырезаются вместе с прочим мусором вокруг блоков.
+    """
+    if isinstance(data, (bytes, bytearray)):
+        data = data.decode("ascii", errors="replace")
+    blocks = _PEM_CERT_RE.findall(data or "")
+    return "\n".join(block.strip() for block in blocks)
+
+
+def resolve_ca_bundle(value: Optional[str] = None):
+    """Данные дополнительных корневых сертификатов и их источник.
+
+    Возвращает ``(cadata, label)``, где ``cadata`` — PEM-строка или
+    DER-байты (то, что принимает ``load_verify_locations``), либо ``None``.
+    ``value=None`` — значение из окружения (``MAX_SSL_CA_BUNDLE``); когда
+    переменная пуста, берётся ``certs/max_ca_bundle.crt`` рядом с bot.py.
+    Значение может быть путём к PEM/DER-файлу, каталогом с ``.crt``/``.pem``
+    или самим PEM-текстом. Явное «none»/«off» отключает добавление.
+    """
+    raw = (MAX_SSL_CA_BUNDLE if value is None else value).strip()
+    if raw.lower() in CA_BUNDLE_DISABLED:
+        return None, ""
+    pem = extract_pem_certificates(raw)
+    if pem:
+        return pem, "MAX_SSL_CA_BUNDLE (PEM)"
+    if raw:
+        path, label = Path(raw).expanduser(), "MAX_SSL_CA_BUNDLE"
+    else:
+        path, label = BUNDLED_CA_BUNDLE, str(BUNDLED_CA_BUNDLE)
+    data = None
+    try:
+        if path.is_dir():
+            chunks = [
+                extract_pem_certificates(item.read_bytes())
+                for item in sorted(path.iterdir())
+                if item.is_file() and item.suffix.lower() in _CA_EXTENSIONS
+            ]
+            data = "\n".join(chunk for chunk in chunks if chunk) or None
+        elif path.is_file():
+            blob = path.read_bytes()
+            # PEM-текст или бинарный DER — load_verify_locations ест и то,
+            # и другое.
+            data = extract_pem_certificates(blob) or blob
+        else:
+            if raw:
+                logger.warning("MAX_SSL_CA_BUNDLE: файл не найден: %s", raw)
+            return None, ""
+    except OSError as error:
+        logger.warning("Не удалось прочитать %s: %s", label, error)
+        return None, ""
+    return data, (label if data else "")
+
+
+def build_ssl_context(force: bool = False) -> ssl.SSLContext:
+    """SSL-контекст для всех исходящих HTTPS-запросов бота.
+
+    Системные корневые сертификаты сохраняются, к ним добавляется бандл
+    УЦ Минцифры — проверка сертификата остаётся полной. Контекст
+    кэшируется, ``force=True`` пересобирает его (нужно тестам).
+    """
+    global _SSL_CONTEXT, _CA_BUNDLE_SOURCE
+    if _SSL_CONTEXT is not None and not force:
+        return _SSL_CONTEXT
+    context = ssl.create_default_context()
+    source = ""
+    if MAX_SSL_VERIFY:
+        data, source = resolve_ca_bundle()
+        if data:
+            context.load_verify_locations(cadata=data)
+    else:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    _SSL_CONTEXT, _CA_BUNDLE_SOURCE = context, source
+    return context
+
+
+def describe_tls_config() -> str:
+    """Описание настроек TLS одной строкой — для стартового лога."""
+    build_ssl_context()
+    if not MAX_SSL_VERIFY:
+        return "проверка сертификата ОТКЛЮЧЕНА (MAX_SSL_VERIFY=false)"
+    if _CA_BUNDLE_SOURCE:
+        return f"системное хранилище + {_CA_BUNDLE_SOURCE}"
+    return "только системное хранилище корневых сертификатов"
+
+
+def is_ssl_verify_error(error: BaseException) -> bool:
+    """Похоже ли исключение на непройденную проверку сертификата.
+
+    aiohttp оборачивает ``ssl.SSLCertVerificationError`` в
+    ``ClientConnectorCertificateError``, поэтому смотрим всю цепочку
+    причин, а не только верхний тип.
+    """
+    current: Optional[BaseException] = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if "CERTIFICATE_VERIFY_FAILED" in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def describe_connection_error(error: BaseException) -> str:
+    """Текст для ``connection_error``: обычная ошибка + подсказка про УЦ."""
+    text = str(error)
+    if is_ssl_verify_error(error) and "MAX_SSL_CA_BUNDLE" not in text:
+        return text + SSL_ERROR_HINT
+    return text
+
+
 def build_url(day: date) -> str:
     return f"{BASE_URL}/{day.isoformat()}"
 
@@ -701,6 +855,7 @@ async def fetch_url(url: str, label: str = "страницы колледжа"):
         async with aiohttp.ClientSession(
             headers=HEADERS,
             timeout=timeout,
+            connector=aiohttp.TCPConnector(ssl=build_ssl_context()),
         ) as session:
             async with session.get(url, allow_redirects=False) as response:
                 status = response.status
@@ -4102,14 +4257,8 @@ class Bot:
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
-            connector = None
-            if not MAX_SSL_VERIFY:
-                import ssl as _ssl
-
-                context = _ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = _ssl.CERT_NONE
-                connector = aiohttp.TCPConnector(ssl=context)
+            # TLS: системное хранилище + бандл УЦ Минцифры (см. build_ssl_context).
+            connector = aiohttp.TCPConnector(ssl=build_ssl_context())
             # total больше polling-timeout (25 c), чтобы long polling
             # не обрывался клиентом.
             timeout = aiohttp.ClientTimeout(total=120, sock_connect=30)
@@ -4163,7 +4312,9 @@ class Bot:
         except (MaxApiError, asyncio.CancelledError):
             raise
         except Exception as error:
-            raise MaxApiError(0, "connection_error", str(error)) from error
+            raise MaxApiError(
+                0, "connection_error", describe_connection_error(error)
+            ) from error
 
     async def _throttle(self, chat_id) -> None:
         """Не чаще ~2 сообщений в секунду в один чат."""
@@ -4320,13 +4471,20 @@ class Bot:
         form.add_field(
             "data", content, filename=path.name, content_type="image/png"
         )
-        async with session.post(url, data=form) as response:
-            raw = await response.text()
-            if response.status >= 400:
-                raise MaxApiError(
-                    response.status, "upload_failed",
-                    f"Загрузка картинки не удалась: HTTP {response.status}",
-                )
+        try:
+            async with session.post(url, data=form) as response:
+                raw = await response.text()
+                if response.status >= 400:
+                    raise MaxApiError(
+                        response.status, "upload_failed",
+                        f"Загрузка картинки не удалась: HTTP {response.status}",
+                    )
+        except (MaxApiError, asyncio.CancelledError):
+            raise
+        except Exception as error:
+            raise MaxApiError(
+                0, "connection_error", describe_connection_error(error)
+            ) from error
         try:
             payload = json.loads(raw) if raw else {}
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -6361,6 +6519,7 @@ async def main() -> None:
     logger.info("Group ID: %s", GROUP_ID)
     logger.info("URL: %s", BASE_URL)
     logger.info("MAX API: %s", MAX_API_BASE_URL)
+    logger.info("TLS: %s", describe_tls_config())
     logger.info("Режим: %s", "webhook" if MAX_WEBHOOK_URL else "long polling")
     logger.info("Check interval: %s сек (%s мин)", CHECK_INTERVAL, CHECK_INTERVAL // 60)
     logger.info("Timezone: %s (UTC+5)", TIMEZONE)

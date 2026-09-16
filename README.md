@@ -99,6 +99,7 @@ PORT=8080
 | `MAX_WEBHOOK_SECRET` | пусто | Секрет webhook-подписки |
 | `PORT` | `8080` | Порт webhook/health сервера |
 | `MAX_SSL_VERIFY` | `true` | Проверка TLS MAX API |
+| `MAX_SSL_CA_BUNDLE` | `certs/max_ca_bundle.crt` | Дополнительные корневые сертификаты (путь/каталог/PEM, `none` — не добавлять) |
 | `GROUP_NAME` / `GROUP_ID` | `ЭС7-24` / `508` | Группа и её ID на сайте |
 | `BASE_URL` / `STAFF_BASE_URL` | см. `.env.example` | Источники расписания |
 | `BIRTHDAY_URL` / `BIRTHDAY_CHAT_ID` | — | Дни рождения группы |
@@ -111,17 +112,72 @@ PORT=8080
 добавь бота в чат группы и посмотри логи, либо подпиши чат `/subscribe`
 с названием группы (бот найдёт его сам).
 
+## TLS: сертификат MAX API
+
+Бот проверяет TLS-сертификат MAX. Если цепочка не собирается, он падает
+на старте с такой ошибкой:
+
+```
+MAX API недоступен ([0] connection_error: Cannot connect to host
+platform-api2.max.ru:443 ssl:True [SSLCertVerificationError: (1,
+'[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+unable to get local issuer certificate (_ssl.c:1016)')]).
+```
+
+Что это бывает и что делать:
+
+1. **Сертификат от УЦ Минцифры (Russian Trusted CA).** Его нет ни в наборе
+   Mozilla, ни в `ca-certificates` образа `python:3.11-slim`. Репозиторий
+   содержит бандл — `certs/max_ca_bundle.crt` (корневой и выпускающий
+   сертификаты с официального CDN Госуслуг `gu-st.ru`; отпечатки и команды
+   проверки — в `certs/README.md`). Бот добавляет его к системному
+   хранилищу в своём SSL-контексте: проверка сертификата остаётся полной,
+   качать и ставить ничего не нужно. В стартовом логе видно, что
+   подхватилось:
+
+   ```
+   TLS: системное хранилище + /app/certs/max_ca_bundle.crt
+   ```
+
+   Не доверяешь этому УЦ — `MAX_SSL_CA_BUNDLE=none`, и останется только
+   системное хранилище.
+2. **Устаревший или отсутствующий `ca-certificates`** (срезанный образ,
+   сборка без сети). У `max.ru` есть и обычные публичные сертификаты
+   (Google Trust Services, TrustAsia, HARICA, SSL.com) — они в стандартном
+   наборе есть, поэтому чинится так:
+   `apt-get update && apt-get install -y ca-certificates && update-ca-certificates`.
+3. **Прокси/файрвол подменяет TLS** — добавь CA своего прокси тем же
+   параметром: `MAX_SSL_CA_BUNDLE=/etc/ssl/corp-proxy-ca.pem`.
+4. `MAX_SSL_VERIFY=false` — полностью выключает проверку сертификата.
+   Крайний вариант для закрытого контура, а не рабочее решение.
+
+Диагностика:
+
+```bash
+# чем реально подписан сертификат MAX
+openssl s_client -connect platform-api2.max.ru:443 -servername platform-api2.max.ru \
+  -showcerts </dev/null 2>/dev/null | grep -E 's:|i:|Verify return code'
+
+# та же проверка, но с бандлом из репозитория
+openssl s_client -connect platform-api2.max.ru:443 -servername platform-api2.max.ru \
+  -CAfile certs/max_ca_bundle.crt </dev/null 2>/dev/null | grep 'Verify return code'
+
+# что видит Python в этом образе
+python -c "import ssl;print(ssl.get_default_verify_paths())"
+```
+
 ## Архитектура
 
 ```
 bot.py              — весь бот: парсинг, рендер, БД, MAX-транспорт, main()
 staff_directory.py  — единый справочник преподавателей (STAFF_ID — истина)
 fonts/              — DejaVuSans (regular + bold) для PNG
+certs/              — корневые сертификаты УЦ Минцифры для TLS (см. certs/README.md)
 data/               — bot.db (SQLite) и временные картинки (не в git)
 tests/
   test_schedule_bot.py — 125 тестов логики (парсинг, рендер, БД, мониторинг)
-  test_max_transport.py — 62 теста MAX-слоя (API-клиент, кнопки, роутинг,
-    webhook-сервер, сквозная отправка)
+  test_max_transport.py — 81 тест MAX-слоя (API-клиент, кнопки, роутинг,
+    webhook-сервер, TLS-доверие, сквозная отправка)
 ```
 
 Транспорт MAX — собственный лёгкий клиент на `aiohttp`, без сторонних SDK:
