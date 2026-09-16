@@ -5,7 +5,9 @@
 """
 
 import asyncio
+import hashlib
 import os
+import ssl
 import tempfile
 
 import aiohttp
@@ -898,6 +900,263 @@ class TestWebhookServer(TransportMixin, TestCase):
         ):
             run(botmod._run_webhook(bot))
         bot.subscribe_webhook.assert_not_awaited()
+
+
+class TestTlsTrust(TestCase):
+    """Доверие сертификату MAX API (УЦ Минцифры) и диагностика ошибок TLS."""
+
+    ROOT_SHA256 = (
+        "71645ADDB4F1BAD50E5BF76365144EFFAF9BB735D6E8C0CA4364B5B8E000B6CD"
+    )
+    SUB_SHA256 = (
+        "BBBDE2103E790B999EC62BD03CF625A5A2E7C316E10AFE6A490EEDEAD8B3FD9B"
+    )
+
+    @staticmethod
+    def _fingerprints(context):
+        """SHA256-отпечатки CA-сертификатов в контексте (как у openssl)."""
+        return {
+            hashlib.sha256(der).hexdigest().upper()
+            for der in context.get_ca_certs(binary_form=True)
+        }
+
+    def setUp(self):
+        self._saved_context = botmod._SSL_CONTEXT
+        self._saved_source = botmod._CA_BUNDLE_SOURCE
+
+    def tearDown(self):
+        botmod._SSL_CONTEXT = self._saved_context
+        botmod._CA_BUNDLE_SOURCE = self._saved_source
+
+    # -- бандл из репозитория --------------------------------------
+
+    def test_bundled_ca_bundle_matches_published_fingerprints(self):
+        """Бандл цел и совпадает с отпечатками из certs/README.md."""
+        self.assertTrue(botmod.BUNDLED_CA_BUNDLE.is_file())
+        pem, label = botmod.resolve_ca_bundle()
+        self.assertIsNotNone(pem)
+        self.assertEqual(label, str(botmod.BUNDLED_CA_BUNDLE))
+        context = ssl.create_default_context()
+        context.load_verify_locations(cadata=pem)
+        fingerprints = self._fingerprints(context)
+        self.assertIn(self.ROOT_SHA256, fingerprints)
+        self.assertIn(self.SUB_SHA256, fingerprints)
+
+    def test_resolve_ca_bundle_from_path(self):
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".pem", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(
+                botmod.BUNDLED_CA_BUNDLE.read_text(encoding="utf-8")
+            )
+            path = handle.name
+        pem, label = botmod.resolve_ca_bundle(path)
+        self.assertEqual(label, "MAX_SSL_CA_BUNDLE")
+        self.assertIn("BEGIN CERTIFICATE", pem)
+
+    def test_resolve_ca_bundle_from_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "one.crt").write_text(
+                botmod.BUNDLED_CA_BUNDLE.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (root / "skip.txt").write_text("не сертификат", encoding="utf-8")
+            pem, label = botmod.resolve_ca_bundle(directory)
+        self.assertEqual(label, "MAX_SSL_CA_BUNDLE")
+        self.assertIn("BEGIN CERTIFICATE", pem)
+
+    def test_resolve_ca_bundle_inline_pem(self):
+        inline = botmod.BUNDLED_CA_BUNDLE.read_text(encoding="utf-8")
+        pem, label = botmod.resolve_ca_bundle(inline)
+        self.assertEqual(pem.count("BEGIN CERTIFICATE"), 2)
+        # комментарии из файла (они на русском) не должны попадать в cadata
+        self.assertNotIn("#", pem)
+        self.assertTrue(pem.isascii())
+        self.assertEqual(label, "MAX_SSL_CA_BUNDLE (PEM)")
+
+    def test_extract_pem_certificates_strips_comments(self):
+        text = "# УЦ Минцифры\n" + botmod.BUNDLED_CA_BUNDLE.read_text(
+            encoding="utf-8"
+        ) + "\nмусор\n"
+        pem = botmod.extract_pem_certificates(text)
+        self.assertTrue(pem.isascii())
+        self.assertEqual(pem.count("BEGIN CERTIFICATE"), 2)
+        context = ssl.create_default_context()
+        context.load_verify_locations(cadata=pem)  # не должно падать
+
+    def test_resolve_ca_bundle_missing_file(self):
+        self.assertEqual(botmod.resolve_ca_bundle("/nope/ca.pem"), (None, ""))
+
+    def test_resolve_ca_bundle_der_file(self):
+        """Файл без PEM-меток (бинарный DER) тоже загружается."""
+        import base64
+
+        pem = botmod.extract_pem_certificates(
+            botmod.BUNDLED_CA_BUNDLE.read_bytes()
+        )
+        body = pem.split("-----")[2]
+        der = base64.b64decode("".join(body.split()))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ca.crt"
+            path.write_bytes(der)
+            data, label = botmod.resolve_ca_bundle(str(path))
+        self.assertEqual(label, "MAX_SSL_CA_BUNDLE")
+        self.assertEqual(data, der)
+        context = ssl.create_default_context()
+        context.load_verify_locations(cadata=data)  # не должно падать
+
+    def test_resolve_ca_bundle_disabled(self):
+        for value in ("none", "off", "NONE"):
+            self.assertEqual(botmod.resolve_ca_bundle(value), (None, ""))
+
+    def test_resolve_ca_bundle_falls_back_to_repo_file(self):
+        with mock.patch.object(botmod, "MAX_SSL_CA_BUNDLE", ""):
+            pem, _label = botmod.resolve_ca_bundle()
+        self.assertIn("BEGIN CERTIFICATE", pem or "")
+
+    # -- SSL-контекст ----------------------------------------------
+
+    def test_build_ssl_context_adds_bundle_keeps_verification(self):
+        with mock.patch.object(botmod, "MAX_SSL_VERIFY", True), \
+                mock.patch.object(botmod, "MAX_SSL_CA_BUNDLE", ""):
+            context = botmod.build_ssl_context(force=True)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        fingerprints = self._fingerprints(context)
+        self.assertIn(self.ROOT_SHA256, fingerprints)
+        self.assertIn(self.SUB_SHA256, fingerprints)
+        self.assertIn(
+            str(botmod.BUNDLED_CA_BUNDLE), botmod.describe_tls_config()
+        )
+
+    def test_build_ssl_context_verify_off(self):
+        with mock.patch.object(botmod, "MAX_SSL_VERIFY", False):
+            context = botmod.build_ssl_context(force=True)
+            description = botmod.describe_tls_config()
+        self.assertEqual(context.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(context.check_hostname)
+        fingerprints = self._fingerprints(context)
+        self.assertNotIn(self.ROOT_SHA256, fingerprints)
+        self.assertIn("ОТКЛЮЧЕНА", description)
+
+    def test_build_ssl_context_cached(self):
+        with mock.patch.object(botmod, "MAX_SSL_VERIFY", True):
+            first = botmod.build_ssl_context(force=True)
+            self.assertIs(first, botmod.build_ssl_context())
+            self.assertIsNot(first, botmod.build_ssl_context(force=True))
+
+    def test_session_and_fetch_use_shared_context(self):
+        expected = botmod.build_ssl_context(force=True)
+
+        async def session_connector():
+            bot = botmod.Bot(token="test-token")
+            session = await bot.ensure_session()
+            try:
+                return session.connector
+            finally:
+                await bot.close()
+
+        connector = run(session_connector())
+        self.assertIsInstance(connector, aiohttp.TCPConnector)
+        self.assertIs(connector._ssl, expected)
+
+        seen = {}
+        original = aiohttp.TCPConnector
+
+        def spy(*args, **kwargs):
+            seen["ssl"] = kwargs.get("ssl")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(botmod.aiohttp, "TCPConnector", spy):
+            self.assertIsNone(
+                run(botmod.fetch_url("http://127.0.0.1:1/x", "теста"))
+            )
+        self.assertIs(seen["ssl"], expected)
+
+    # -- диагностика ошибки ----------------------------------------
+
+    def _cert_error(self):
+        inner = ssl.SSLCertVerificationError(
+            1,
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "unable to get local issuer certificate (_ssl.c:1016)",
+        )
+        key = SimpleNamespace(
+            host="platform-api2.max.ru", port=443, is_ssl=True,
+        )
+        return aiohttp.ClientConnectorCertificateError(key, inner)
+
+    def test_is_ssl_verify_error(self):
+        wrapped = self._cert_error()
+        self.assertTrue(botmod.is_ssl_verify_error(wrapped))
+        self.assertTrue(
+            botmod.is_ssl_verify_error(wrapped.certificate_error)
+        )
+        self.assertFalse(botmod.is_ssl_verify_error(OSError("refused")))
+
+    def test_is_ssl_verify_error_follows_cause(self):
+        inner = ssl.SSLCertVerificationError(1, "certificate verify failed")
+        outer = Exception("транспорт упал")
+        outer.__cause__ = inner
+        self.assertTrue(botmod.is_ssl_verify_error(outer))
+
+    def test_describe_connection_error_adds_hint(self):
+        text = botmod.describe_connection_error(self._cert_error())
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", text)
+        self.assertIn("MAX_SSL_CA_BUNDLE", text)
+        self.assertIn("certs/max_ca_bundle.crt", text)
+
+    def test_describe_connection_error_passthrough(self):
+        error = OSError("Cannot connect to host x:443 ssl:default")
+        self.assertEqual(botmod.describe_connection_error(error), str(error))
+
+    def test_api_wraps_tls_error_with_hint(self):
+        """Настоящий путь ошибки: _api → MaxApiError с подсказкой про УЦ."""
+        error = self._cert_error()
+
+        class BoomContext:
+            async def __aenter__(self):
+                raise error
+
+            async def __aexit__(self, *args):
+                return False
+
+        class BoomSession:
+            closed = False
+
+            def request(self, *args, **kwargs):
+                return BoomContext()
+
+        bot = botmod.Bot(token="test-token", session=BoomSession())
+        with self.assertRaises(botmod.MaxApiError) as caught:
+            run(bot.get_me())
+        self.assertEqual(caught.exception.code, "connection_error")
+        self.assertEqual(caught.exception.status, 0)
+        self.assertIn("MAX_SSL_CA_BUNDLE", str(caught.exception))
+
+    def test_upload_image_wraps_tls_error_with_hint(self):
+        error = self._cert_error()
+
+        class BoomContext:
+            async def __aenter__(self):
+                raise error
+
+            async def __aexit__(self, *args):
+                return False
+
+        bot = make_bot()
+        bot._api.return_value = {"url": "https://iu.oneme.ru/upload"}
+        bot.session = SimpleNamespace(
+            closed=False, post=mock.Mock(return_value=BoomContext())
+        )
+        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+            tmp.write(b"fake-png")
+            tmp.flush()
+            with self.assertRaises(botmod.MaxApiError) as caught:
+                run(bot._upload_image(tmp.name))
+        self.assertEqual(caught.exception.code, "connection_error")
+        self.assertIn("MAX_SSL_CA_BUNDLE", str(caught.exception))
 
 
 if __name__ == "__main__":
